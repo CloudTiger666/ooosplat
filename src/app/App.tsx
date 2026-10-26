@@ -11,6 +11,7 @@ import { taskIsActive } from "../types/tasks";
 import { SharedTaskDetail } from "../components/SharedTaskDetail";
 import { useSharedTasks } from "./useSharedTasks";
 import { useProgressMessage } from "./useProgressMessage";
+import { useGpsDetection } from './useGpsDetection';
 import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import {
   BellDot, Blend, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clapperboard, Cpu,
@@ -418,6 +419,18 @@ export function App() {
       }),
     }));
   }, [mutateTaskWorkspace]);
+
+  useGpsDetection(drafts, updateDraft);
+  const lastGpsEvent = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeDraftId || !store.liveTask || !drafts.find(d => d.id === activeDraftId)?.running) return;
+    const event = [...store.events].reverse().find(e => e.taskId === store.liveTask!.task_id && e.runId === store.liveTask!.run_id && (e.message === '[GPS] detected' || e.message === 'GPS 辅助未启用，已切换为不使用 GPS 的生成方式。'));
+    if (!event) return;
+    const key = `${activeDraftId}:${event.taskId}:${event.runId}:${event.sequence}`;
+    if (lastGpsEvent.current === key) return;
+    lastGpsEvent.current = key;
+    updateDraft(activeDraftId, draft => ({ gpsFallback: event.message !== '[GPS] detected' ? projectionIdentity(draft) : undefined, gpsDetection: { sourceIdentity: projectionIdentity(draft), detected: true } }));
+  }, [store.events, store.liveTask, drafts, activeDraftId, updateDraft]);
 
   useEffect(() => {
     if (!store.error) {
@@ -1876,7 +1889,7 @@ export function App() {
             </button>
             {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
           </div>
-          {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} checking={(selectedDraft.inputChecking && !selectedDraft.inputPlanning) || selectedDraft.needsValidation} error={selectedDraft.inputError} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyze(selectedDraft.id, selectedDraft.inputPath!, selectedDraft.quality, selectedDraft.plannerEnabled)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
+          {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} gpsDetected={selectedDraft.gpsDetection?.sourceIdentity === projectionIdentity(selectedDraft) && selectedDraft.gpsDetection.detected} gpsFallback={selectedDraft.gpsFallback === projectionIdentity(selectedDraft)} checking={(selectedDraft.inputChecking && !selectedDraft.inputPlanning) || selectedDraft.needsValidation} error={selectedDraft.inputError} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyze(selectedDraft.id, selectedDraft.inputPath!, selectedDraft.quality, selectedDraft.plannerEnabled)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
           </div>
         </div>
 
@@ -1954,7 +1967,7 @@ export function App() {
               </button>
               {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
             </div>
-            {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} checking={selectedDraft.inputChecking || selectedDraft.needsValidation} error={selectedDraft.error} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyzeReshoot(selectedDraft.id, selectedDraft.sourceProjectId!, selectedDraft.inputPath!, selectedDraft.inputType)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
+            {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} gpsDetected={selectedDraft.gpsDetection?.sourceIdentity === projectionIdentity(selectedDraft) && selectedDraft.gpsDetection.detected} gpsFallback={selectedDraft.gpsFallback === projectionIdentity(selectedDraft)} checking={selectedDraft.inputChecking || selectedDraft.needsValidation} error={selectedDraft.error} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyzeReshoot(selectedDraft.id, selectedDraft.sourceProjectId!, selectedDraft.inputPath!, selectedDraft.inputType)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
             </div>
           </div>
 

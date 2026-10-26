@@ -68,6 +68,9 @@ const zhCN = {
   "source.manualPanorama": "已选择完整全景视频，将按全景视频生成",
   "source.images": "普通图片",
   "source.imagesHint": "将按普通图片处理",
+  "source.gpsDetected": "已识别图片中的 GPS 信息",
+  "source.gpsHint": "将使用有效位置信息辅助生成",
+  "source.gpsFallback": "GPS 辅助未启用，已切换为不使用 GPS 的生成方式。",
   "source.historyImages": "本任务按普通图片处理",
   "source.panoramaImages": "全景图片",
   "source.chooseImageType": "请选择图片类型",
@@ -887,6 +890,9 @@ const en: Record<TranslationKey, string> = {
   "source.manualPanorama": "Full panorama selected. This video will use panorama generation.",
   "source.images": "Ordinary images",
   "source.imagesHint": "These images will use ordinary-image processing.",
+  "source.gpsDetected": "GPS information detected in images",
+  "source.gpsHint": "Valid location information will be used to assist generation.",
+  "source.gpsFallback": "GPS assistance is unavailable. Generation will continue without GPS.",
   "source.historyImages": "This task uses ordinary-image processing.",
   "source.panoramaImages": "Panorama images",
   "source.chooseImageType": "Choose image type",
@@ -1372,7 +1378,7 @@ export function localizePipelineMessage(locale: Locale, message: string): string
   if (diagnosticSuffix >= 0) {
     return localizePipelineMessage(locale, message.slice(0, diagnosticSuffix)) + message.slice(diagnosticSuffix);
   }
-  for (const key of ['source.unsupportedImages','source.panoramaImagesBudget','source.panoramaReshoot','source.ambiguousImages','reshoot.fallbackRunning','reshoot.multiCameraHint','reshoot.panoramaHint'] as const) {
+  for (const key of ['source.gpsFallback','source.unsupportedImages','source.panoramaImagesBudget','source.panoramaReshoot','source.ambiguousImages','reshoot.fallbackRunning','reshoot.multiCameraHint','reshoot.panoramaHint'] as const) {
     if (message === zhCN[key]) return en[key];
   }
   const exact = exactPipelineEnglish[message];

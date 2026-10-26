@@ -320,7 +320,20 @@ async fn source_assets(id: uuid::Uuid) -> Result<SourceAssets> {
         .as_ref()
         .and_then(|r| r.recipe.as_ref())
         .is_some_and(|r| r.actual.reconstruction == ReconstructionMode::Full);
-    let model = if full {
+    let model = if state
+        .gps
+        .as_ref()
+        .is_some_and(|g| matches!(g.status.as_str(), "complete" | "matching"))
+    {
+        let model = root.join("work/colmap/gps-v1/model");
+        if super::gps_runner::model_identity(&model).ok()
+            != state.gps.as_ref().and_then(|g| g.output_identity.clone())
+        {
+            return Err(invalid("Source georeference model identity changed"));
+        }
+        ReconstructionValidator::validate(&images, &model)?;
+        model
+    } else if full {
         best_sparse_model(&images, &root.join("work/colmap/sparse-full"))
             .await?
             .0
@@ -641,6 +654,9 @@ impl PipelineRunner {
         manager.write_metadata(&paths.metadata, &metadata).await?;
         let mut state = manager.read_state(&paths.state).await?;
         state.planner_enabled = self.planner_enabled;
+        if metadata.input_type == ProjectInputType::Images {
+            state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
+        }
         state.video_projection = options.projection;
         state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
         let plan = ReshootPlan::resolve(options.condition, true, info.warm_available);
@@ -660,6 +676,7 @@ impl PipelineRunner {
                 new_names: vec![],
                 warm_parameters: None,
                 init_sha256: None,
+                init_georeference: None,
                 stored_input_identity: Some(panorama::source_identity(&metadata.source_path)?),
                 panorama_frames: vec![],
             }),
@@ -1528,6 +1545,39 @@ impl PipelineRunner {
             save_recipe(manager, paths, &mut state, &checkpoint, &recipe).await?;
             break model;
         };
+        let model = if state.gps.is_some() && metadata.input_type == ProjectInputType::Images {
+            let snapshot = metadata.clone();
+            let current_paths = paths.clone();
+            let current_recipe = recipe.clone();
+            let cancel = cancel.clone();
+            let (records, origin) = tokio::task::spawn_blocking(move || {
+                super::gps_runner::reshoot_records(
+                    &snapshot,
+                    &current_paths,
+                    &current_recipe,
+                    &cancel,
+                )
+            })
+            .await
+            .map_err(|e| SplatError::Process(e.to_string()))??;
+            let fixed = paths.colmap.join("fixed-cameras.txt");
+            self.apply_gps(
+                manager,
+                paths,
+                &mut state,
+                records,
+                origin,
+                &model,
+                (recipe.actual.reconstruction == ReconstructionMode::Incremental)
+                    .then_some(base.as_path()),
+                (recipe.actual.reconstruction == ReconstructionMode::Incremental)
+                    .then_some(fixed.as_path()),
+            )
+            .await?
+            .unwrap_or(model)
+        } else {
+            model
+        };
         let report = ReconstructionValidator::validate(&paths.frames, &model)?;
         reshoot_log(
             &self.events,
@@ -1665,16 +1715,57 @@ impl PipelineRunner {
                 );
                 let init = dataset.join("init.ply");
                 let model = provenance.source_final_ply.clone();
-                let (_, _, original_hash) = validate_ply(&model, &cancel).await?;
-                if !init.is_file() || recipe.init_sha256.as_deref() != Some(&original_hash) {
+                let (original_info, original_sh, original_hash) =
+                    validate_ply(&model, &cancel).await?;
+                let gps_transform = state
+                    .gps
+                    .as_ref()
+                    .filter(|g| g.status == "complete")
+                    .and_then(|g| g.transform);
+                let gps_key = gps_transform
+                    .map(|t| serde_json::to_string(&t))
+                    .transpose()?;
+                if !init.is_file()
+                    || recipe.init_sha256.as_deref() != Some(&original_hash)
+                    || recipe.init_georeference != gps_key
+                {
                     let pending = dataset.join("init.ply.partial");
-                    copy_reshoot_file(&model, &pending, &cancel).await?;
-                    let (_, _, snapshot_hash) = validate_ply(&pending, &cancel).await?;
-                    if snapshot_hash != original_hash {
+                    if let Some(transform) = gps_transform {
+                        let source = model.clone();
+                        let output = pending.clone();
+                        let cancellation = cancel.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::reconstruction::splat_transform::export_transformed_ply_to(
+                                &source,
+                                &output,
+                                transform.engine_transform(),
+                                Default::default(),
+                                |_, _| {},
+                                || {
+                                    if cancellation.is_cancelled() {
+                                        Err(SplatError::Cancelled)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|e| invalid(&e.to_string()))??;
+                    } else {
+                        copy_reshoot_file(&model, &pending, &cancel).await?;
+                    }
+                    let (snapshot_info, snapshot_sh, snapshot_hash) =
+                        validate_ply(&pending, &cancel).await?;
+                    if snapshot_info.splat_count != original_info.splat_count
+                        || snapshot_sh != original_sh
+                        || (gps_transform.is_none() && snapshot_hash != original_hash)
+                    {
                         return Err(changed());
                     }
                     atomic_replace_file(&pending, &init).await?;
                     recipe.init_sha256 = Some(original_hash);
+                    recipe.init_georeference = gps_key;
                 }
                 let (info, sh, _) = validate_ply(&init, &cancel).await?;
                 initial_points = info.splat_count;
@@ -2082,7 +2173,7 @@ impl PipelineRunner {
     }
 }
 
-fn coordinates_match(base: &Path, updated: &Path) -> Result<bool> {
+pub(super) fn coordinates_match(base: &Path, updated: &Path) -> Result<bool> {
     let before = read_cameras(base)?;
     let after = read_cameras(updated)?;
     for camera in before {
@@ -2130,6 +2221,157 @@ fn sync_refined_cameras(database: &Path, model: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "Requires the completed public GPS smoke project and native engines/GPU; repeated photographs test integration, not new detail"]
+    async fn native_public_gps_reshoot() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let original = repo.join(".cache/gps-v1/public-projects/20261026-203054_images");
+        let source_metadata: ProjectMetadata =
+            serde_json::from_slice(&std::fs::read(original.join("project.json")).unwrap()).unwrap();
+        let source_state: PipelineStateFile =
+            serde_json::from_slice(&std::fs::read(original.join("state.json")).unwrap()).unwrap();
+        let source = SourceAssets {
+            root: original.clone(),
+            metadata: source_metadata.clone(),
+            state: source_state,
+            images: original.join("work/frames"),
+            colmap_images: original.join("work/colmap_frames"),
+            masks: original.join("work/masks"),
+            database: original.join("work/colmap/database.db"),
+            model: original.join("work/colmap/gps-v1/model"),
+        };
+        let before = source_identity(&source).unwrap();
+        let protected = [
+            "final.ply",
+            "project.json",
+            "state.json",
+            "work/colmap/database.db",
+        ];
+        let hashes: Vec<_> = protected
+            .iter()
+            .map(|n| panorama::fingerprint(&original.join(n)).unwrap())
+            .collect();
+        let camera = read_cameras(&source.model).unwrap().remove(0);
+        let root = repo
+            .join(".cache/gps-v1/reshoot-projects")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let input = root.join("input");
+        std::fs::create_dir(&input).unwrap();
+        let originals = crate::video::list_images(&source_metadata.source_path).unwrap();
+        // Repeated real photographs deliberately isolate registration/coordinate
+        // and warm-init correctness. They cannot assess added scene coverage.
+        for p in originals.iter().take(6) {
+            std::fs::copy(p, input.join(p.file_name().unwrap())).unwrap();
+        }
+        let manager = ProjectManager::for_diagnostics(root.join("projects"));
+        let (paths, mut metadata) = manager
+            .create_reshoot_v2(
+                &input,
+                Quality::Fast,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        metadata.reshoot = Some(ReshootProvenance {
+            source_project_id: source_metadata.id,
+            source_project_path: original.clone(),
+            source_final_ply: original.join("final.ply"),
+            reshoot_source_path: metadata.source_path.clone(),
+            camera_id: camera.id,
+            camera_model: camera.model.clone(),
+            width: camera.width,
+            height: camera.height,
+            has_alpha: false,
+            mask_count: 0,
+            source_image_count: 18,
+            reshoot_frame_count: 6,
+            registered_reshoot_count: 0,
+        });
+        let mut state = manager.read_state(&paths.state).await.unwrap();
+        state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
+        let options = ReshootOptions {
+            condition: ModelCondition::Good,
+            camera_relation: Some(CameraRelation::Same),
+            allow_fallback: false,
+            source_identity: before.clone(),
+            input_identity: panorama::source_identity(&input).unwrap(),
+            projection: VideoProjection::Perspective,
+            image_matching_strategy: crate::project::ImageMatchingStrategy::Exhaustive,
+        };
+        let plan = ReshootPlan::resolve(ModelCondition::Good, true, true);
+        state.reshoot = Some(ReshootState {
+            recipe: Some(ReshootRecipe {
+                version: RECIPE_VERSION,
+                normal_parameters_version: Some(1),
+                camera_assignment: None,
+                options,
+                initial: plan,
+                actual: plan,
+                batch_id: paths.id.simple().to_string(),
+                reconstruction_fallbacks: 0,
+                training_fallbacks: 0,
+                expanded_matching: false,
+                source_names: vec![],
+                new_names: vec![],
+                warm_parameters: None,
+                init_sha256: None,
+                init_georeference: None,
+                stored_input_identity: Some(
+                    panorama::source_identity(&metadata.source_path).unwrap(),
+                ),
+                panorama_frames: vec![],
+            }),
+            ..Default::default()
+        });
+        manager.write_state(&paths.state, &state).await.unwrap();
+        manager
+            .write_metadata(&paths.metadata, &metadata)
+            .await
+            .unwrap();
+        let runner = PipelineRunner::new(EnginePaths::from_root(repo.join("engines")), |event| {
+            if event.message.starts_with("[GPS]")
+                || event.message == crate::reconstruction::gps::FALLBACK_MESSAGE
+            {
+                println!("{}", event.message);
+            }
+        });
+        let acceleration = runner.verify_pipeline_engines().await.unwrap();
+        let result = runner
+            .execute_reshoot_v2(
+                &manager,
+                &paths,
+                &mut metadata,
+                state,
+                &acceleration,
+                source,
+            )
+            .await
+            .unwrap();
+        let state = manager.read_state(&paths.state).await.unwrap();
+        println!(
+            "GPS reshoot: {} ; {} splats; GPS {}",
+            paths.project.display(),
+            result.splat_count,
+            state.gps.as_ref().unwrap().status
+        );
+        assert_eq!(state.gps.unwrap().status, "complete");
+        assert!(result.splat_count > 0);
+        assert!(state
+            .reshoot
+            .unwrap()
+            .recipe
+            .unwrap()
+            .init_georeference
+            .is_some());
+        for (name, expected) in protected.iter().zip(hashes) {
+            assert_eq!(
+                panorama::fingerprint(&original.join(name)).unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn reshoot_preparation_quiet_notice_is_bounded_and_resets_on_activity() {
@@ -2692,6 +2934,7 @@ mod tests {
                 new_names: vec![],
                 warm_parameters: None,
                 init_sha256: None,
+                init_georeference: None,
                 stored_input_identity: Some(
                     panorama::source_identity(&metadata.source_path).unwrap(),
                 ),

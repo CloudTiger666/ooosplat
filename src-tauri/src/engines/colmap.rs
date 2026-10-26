@@ -123,7 +123,7 @@ pub fn require_verified_cli(executable: &Path) -> Result<()> {
     }
 }
 
-async fn run_colmap(
+pub(crate) async fn run_colmap(
     executable: &Path,
     mut args: Vec<OsString>,
     working_directory: &Path,

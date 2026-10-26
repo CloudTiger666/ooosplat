@@ -12,6 +12,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
+#[path = "gps_runner.rs"]
+mod gps_runner;
 #[path = "reshoot_runner.rs"]
 mod reshoot_runner;
 
@@ -1331,6 +1333,7 @@ impl PipelineRunner {
         state.video_projection = self.video_projection;
         if state.input_type == ProjectInputType::Images {
             state.image_matching_strategy = self.image_matching_strategy;
+            state.gps = Some(crate::reconstruction::gps::Checkpoint::pending());
         }
         state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
         state.planner_enabled = self.planner_enabled;
@@ -3168,6 +3171,36 @@ impl PipelineRunner {
                 adopted: state.bridge_backfill.status == BridgeBackfillStatus::Completed,
             });
         }
+        let (model, report) =
+            if state.gps.is_some() && prepared.input_type == ProjectInputType::Images {
+                let sources = gps_runner::generation_inputs(metadata, &state)?;
+                let cancel = self.process_manager.child_token();
+                let records = tokio::task::spawn_blocking(move || {
+                    crate::reconstruction::gps::collect(&sources, &cancel)
+                })
+                .await
+                .map_err(|e| SplatError::Process(e.to_string()))??;
+                if let Some(adjusted) = self
+                    .apply_gps(
+                        project_manager,
+                        paths,
+                        &mut state,
+                        records,
+                        None,
+                        &model,
+                        None,
+                        None,
+                    )
+                    .await?
+                {
+                    let report = ReconstructionValidator::validate(&paths.frames, &adjusted)?;
+                    (adjusted, report)
+                } else {
+                    (model, report)
+                }
+            } else {
+                (model, report)
+            };
         let warning = (report.quality == ReconstructionQuality::Warning).then(|| {
             format!(
                 "注册率 {:.1}%：低于 {:.1}%，将继续训练，但结果质量可能受影响",

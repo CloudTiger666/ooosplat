@@ -414,6 +414,7 @@ h1, h2 { margin: 0; font: 650 29px/1 "Bahnschrift", "Microsoft YaHei UI", sans-s
 .media-source-status { min-width: 0; margin: 0; padding: 14px 16px; border-top: 1px solid var(--line-dark); font-size: 13px; line-height: 1.6; }
 .media-source-heading { display: flex; align-items: center; gap: 11px; }
 .media-source-copy { flex: 1; min-width: 0; }
+.gps-source-hint { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .media-source-copy > strong { display: block; font-size: 13px; }
 .media-source-type-icon { flex-shrink: 0; color: var(--blue); }
 .media-source-copy > p, .media-source-status > .media-source-warning { margin: 6px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }

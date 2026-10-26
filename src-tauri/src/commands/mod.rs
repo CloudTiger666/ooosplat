@@ -489,6 +489,30 @@ pub async fn analyze_input(app: tauri::AppHandle, path: String) -> Result<InputA
     }
 }
 
+/// Independent of projection/quality planning: GPS never gates task creation.
+#[tauri::command]
+pub async fn detect_image_gps(path: String, source_identity: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        let path = Path::new(&path);
+        if !path.is_dir()
+            || crate::video::image_projection::source_identity(path)? != source_identity
+        {
+            return Err(SplatError::Process(
+                "素材文件已发生变化，请重新分析后再生成".into(),
+            ));
+        }
+        let detected = crate::video::gps::detect(&crate::video::list_images(path)?);
+        if crate::video::image_projection::source_identity(path)? != source_identity {
+            return Err(SplatError::Process(
+                "素材文件已发生变化，请重新分析后再生成".into(),
+            ));
+        }
+        Ok(detected)
+    })
+    .await
+    .map_err(|e| SplatError::Process(e.to_string()))?
+}
+
 async fn video_preflight_diagnostics<T>(
     app: &tauri::AppHandle,
     executable: &Path,

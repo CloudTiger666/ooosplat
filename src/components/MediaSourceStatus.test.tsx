@@ -12,6 +12,19 @@ beforeEach(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
 async function render(props: ComponentProps<typeof MediaSourceStatus>) { await act(async () => root.render(<LanguageProvider key={localStorage.getItem('ooo-splat-language')}><MediaSourceStatus {...props} /></LanguageProvider>)); }
 
+it.each(['zh-CN', 'en'] as const)('shows only the approved GPS hint, never coordinates, counts, historical or video claims (%s)', async locale => {
+  localStorage.setItem('ooo-splat-language', locale);
+  await render({ inputType: 'images', gpsDetected: true });
+  expect(container.querySelector('.gps-source-hint strong')?.textContent).toBe(locale === 'zh-CN' ? '已识别图片中的 GPS 信息' : 'GPS information detected in images');
+  expect(container.querySelector('.gps-source-hint p')?.textContent).toBe(locale === 'zh-CN' ? '将使用有效位置信息辅助生成' : 'Valid location information will be used to assist generation.');
+  await render({ inputType: 'images', gpsDetected: true, gpsFallback: true });
+  expect(container.querySelector('.gps-source-hint p')?.textContent).toBe(locale === 'zh-CN' ? 'GPS 辅助未启用，已切换为不使用 GPS 的生成方式。' : 'GPS assistance is unavailable. Generation will continue without GPS.');
+  expect(container.querySelector('.gps-source-hint')?.textContent).not.toMatch(/[0-9]/);
+  for (const props of [{ inputType: 'images' as const, historical: true }, { inputType: 'video' as const }, { inputType: 'images' as const, gpsDetected: false }]) {
+    await render({ gpsDetected: true, ...props }); expect(container.querySelector('.gps-source-hint')).toBeNull();
+  }
+});
+
 it('shows loading instead of an old projection result and offers retry only for analysis errors', async () => {
   await render({ inputType: 'video', checking: true, projection: 'equirectangular', detection });
   expect(container.textContent).toBe('正在检测视频类型…');

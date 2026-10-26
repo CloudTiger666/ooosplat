@@ -213,6 +213,8 @@ pub struct ReshootRecipe {
     #[serde(default)]
     pub init_sha256: Option<String>,
     #[serde(default)]
+    pub init_georeference: Option<String>,
+    #[serde(default)]
     pub stored_input_identity: Option<String>,
     #[serde(default)]
     pub panorama_frames: Vec<PanoramaFrameRecord>,
@@ -426,6 +428,7 @@ mod tests {
             new_names: vec![],
             warm_parameters: None,
             init_sha256: None,
+            init_georeference: None,
             stored_input_identity: None,
             panorama_frames: vec![],
         };
