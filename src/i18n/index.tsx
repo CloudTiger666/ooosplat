@@ -230,9 +230,14 @@ const zhCN = {
   "language.switchTo": "中英文切换 / Switch language",
   "language.target": "EN",
   "top.settings": "设置",
-  "top.checkingEngines": "正在检查内置引擎",
+  "top.checkingEngines": "正在检查引擎",
   "top.engineIssues": "{count} 个引擎异常",
-  "top.enginesReady": "FFmpeg · COLMAP · Brush 就绪",
+  "top.enginesReady": "引擎就绪",
+  "top.enginePath": "路径",
+  "top.engineExists": "文件存在",
+  "top.engineCanStart": "可启动",
+  "top.yes": "是",
+  "top.no": "否",
   "update.install": "更新至 {version}",
   "update.found": "发现新版本",
   "update.settingsTitle": "版本更新",
@@ -1044,7 +1049,7 @@ const en: Record<TranslationKey, string> = {
   "export.htmlWarning": "Package the current edits at full quality into a single HTML file. Double-click to view offline and play the animation. File size is about 4/3 of the corresponding PLY (unfiltered source estimate: {size}, plus the viewer). Large models still depend on browser and device capacity. The original model and edit.ply will not be overwritten.",
   "planner.label": "Auto Optimize (Experimental)", "planner.hint": "When enabled, OOOSplat optimizes reconstruction and training parameters and automatically applies recovery, usually reducing generation time and improving detail, especially for image inputs",
   "common.close": "Close", "common.cancel": "Cancel", "common.retry": "Retry", "common.saved": "Saved", "common.saving": "Saving", "common.failed": "Failed", "common.ready": "Ready", "common.unavailable": "Unavailable", "common.frames": "{count} frames", "common.images": "{count} images",
-  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking bundled engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "FFmpeg · COLMAP · Brush ready", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
+  "language.switchTo": "中英文切换 / Switch language", "language.target": "中文", "top.settings": "Settings", "top.checkingEngines": "Checking engines", "top.engineIssues": "{count} engine issues", "top.enginesReady": "Engines ready", "top.enginePath": "Path", "top.engineExists": "File exists", "top.engineCanStart": "Can start", "top.yes": "Yes", "top.no": "No", "update.install": "Update to {version}", "update.downloading": "Downloading update", "update.downloadingProgress": "Downloading update {percent}%", "update.upToDate": "Up to date", "update.checking": "Checking for updates", "update.checkFailed": "Update check failed", "update.installFailed": "Update failed, retry", "update.waitsForTask": "Update once the task finishes", "update.installBlockedHint": "Updates are not installed while a task is running, so processing is not interrupted", "update.pausedForTask": "A task is running, so the install was paused; update again once it finishes", "update.startBlockedByDownload": "Available once the update finishes downloading",
   "task.create": "Create New Task", "task.running": "Running", "task.idle": "Standby", "task.preparing": "Preparing", "task.queued": "Queued", "task.console": "Generation console",
   "input.label": "Input media", "input.typeAria": "Choose input media type", "input.video": "Video", "input.images": "Images", "input.videoTypes": "MP4 or MOV", "input.imageTypes": "JPG, JPEG, or PNG folder", "input.selectImages": "Choose image sequence folder", "input.selectVideo": "Choose an MP4 or MOV video", "input.selectImagesHint": "Choose a folder containing JPG, JPEG, or PNG images", "input.selectVideoHint": "Choose a video file on this computer", "input.dropHere": "Drop to import media", "input.dropSingle": "Drop exactly one MP4/MOV file or one image folder",
   "project.root": "Projects root", "project.readingRoot": "Reading default folder", "project.rootHint": "Each generation creates a separate project folder here, with final.ply saved at its root.", "project.syncMissing": "The completed project has not appeared in the project list yet", "project.syncFailed": "The task completed, but the project list could not be refreshed: {detail}",
@@ -1316,6 +1321,7 @@ const exactPipelineEnglish: Record<string, string> = {
   "正在校验并发布 final.ply": "Validating and publishing final.ply",
   "全部处理完成": "All processing completed",
   "任务已取消": "Task cancelled",
+  "引擎可启动": "Engine can start",
   "正在创建项目": "Creating project",
   "已有任务正在运行": "Another task is already running",
   "任务运行期间不能删除项目": "Projects cannot be deleted while a task is running",
@@ -1362,12 +1368,21 @@ const exactPipelineEnglish: Record<string, string> = {
 
 export function localizePipelineMessage(locale: Locale, message: string): string {
   if (locale === "zh-CN") return message;
+  const diagnosticSuffix = message.search(/\n(?:Diagnostic log:|Could not save diagnostic log:)/);
+  if (diagnosticSuffix >= 0) {
+    return localizePipelineMessage(locale, message.slice(0, diagnosticSuffix)) + message.slice(diagnosticSuffix);
+  }
   for (const key of ['source.unsupportedImages','source.panoramaImagesBudget','source.panoramaReshoot','source.ambiguousImages','reshoot.fallbackRunning','reshoot.multiCameraHint','reshoot.panoramaHint'] as const) {
     if (message === zhCN[key]) return en[key];
   }
   const exact = exactPipelineEnglish[message];
   if (exact) return exact;
   const patterns: Array<[RegExp, (...values: string[]) => string]> = [
+    [/^帮助命令退出码：([^\n]+)\n([\s\S]*)$/, (code, detail) => `Engine check exit code: ${code}\n${detail}`],
+    [/^未找到 ([\s\S]+)$/, (path) => `Not found: ${path}`],
+    [/^本地处理引擎无法启动：(.+)（缺少运行所需的 DLL（退出码 0xC0000135）\n([\s\S]*)）$/, (engine, detail) => `Local processing engine could not start: ${engine} (required DLL missing, exit code 0xC0000135)\n${detail}`],
+    [/^本地处理引擎无法启动：([\s\S]+)$/, (detail) => `Local processing engine could not start: ${detail}`],
+    [/^外部进程执行失败：FFprobe 视频分析失败，退出码 ([^，]+)，引擎 ([\s\S]+)$/, (code, detail) => `FFprobe video analysis failed, exit code ${code}, executable ${detail}`],
     [/^正在准备全景图片 ([\d,]+)\/([\d,]+)$/, (current,total) => `Preparing panorama images ${current}/${total}`],
     [/^正在准备训练图片：全景图片 ([\d,]+)\/([\d,]+)，六面图片 ([\d,]+)\/([\d,]+)$/, (current,total,faces,totalFaces) => `Preparing training images: panorama images ${current}/${total}, face images ${faces}/${totalFaces}`],
     [/^图像匹配进程仍在运行，最近 (\d+) 秒无新输出。此步骤可能耗时较长，请耐心等待$/, seconds => `The image-matching process is still running, with no new output for ${seconds} seconds. This step may take a while. Please wait.`],

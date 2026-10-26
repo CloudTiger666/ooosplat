@@ -4,6 +4,7 @@ import { ProjectRow } from "../components/ProjectRow";
 import { ProjectResultStats } from "../components/ProjectResultStats";
 import { TaskConfiguration } from "../components/TaskConfiguration";
 import { MediaSourceStatus } from '../components/MediaSourceStatus';
+import { EngineStatusPopover } from '../components/EngineStatusPopover';
 import { isProgressEvent, stagePercent } from '../lib/progressState';
 import { TaskProgress } from "../components/TaskProgress";
 import { taskIsActive } from "../types/tasks";
@@ -1843,7 +1844,7 @@ export function App() {
         <button className="settings-action language-action" type="button" title={t("language.switchTo")} aria-label={t("language.switchTo")} onClick={toggleLocale}><Languages size={15} />{t("language.target")}</button>
         {updates.release && <button className="settings-action update-notice-action" type="button" onClick={updates.open}><BellDot size={15} />{t("update.found")}</button>}
         <button className="settings-action" type="button" onClick={() => setSettingsOpen(true)}><Settings2 size={15} />{t("top.settings")}</button>
-        <div className="engine-summary"><span className={missingEngines.length ? "status-light warning" : "status-light"} />{store.engines.length === 0 ? t("top.checkingEngines") : missingEngines.length ? t("top.engineIssues", { count: missingEngines.length }) : t("top.enginesReady")}</div>
+        <EngineStatusPopover engines={store.engines} />
       </div>
     </header>
 

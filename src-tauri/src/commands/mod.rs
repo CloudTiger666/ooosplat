@@ -12,7 +12,7 @@ pub mod model_export;
 
 use crate::{
     engines::{
-        ffprobe::probe_video,
+        ffprobe::{probe_video, with_probe_diagnostics},
         health::{
             check_colmap_acceleration as refresh_colmap_acceleration,
             check_colmap_acceleration_cached as detect_colmap_acceleration,
@@ -479,7 +479,28 @@ async fn analyze_media(engine_paths: &EnginePaths, input: &Path) -> Result<Input
 
 #[tauri::command]
 pub async fn analyze_input(app: tauri::AppHandle, path: String) -> Result<InputAnalysis> {
-    analyze_media(&paths_for_app(&app), Path::new(&path)).await
+    let engines = paths_for_app(&app);
+    let input = Path::new(&path);
+    let result = analyze_media(&engines, input).await;
+    if input.is_dir() {
+        result
+    } else {
+        video_preflight_diagnostics(&app, &engines.ffprobe, input, result).await
+    }
+}
+
+async fn video_preflight_diagnostics<T>(
+    app: &tauri::AppHandle,
+    executable: &Path,
+    input: &Path,
+    result: Result<T>,
+) -> Result<T> {
+    let log_path = app
+        .path()
+        .app_log_dir()
+        .map(|directory| directory.join("ffprobe-probe-latest.log"))
+        .map_err(|error| format!("Cannot resolve diagnostic log directory: {error}"));
+    with_probe_diagnostics(result, executable, input, log_path).await
 }
 
 async fn input_analysis_for_plan(
@@ -623,27 +644,32 @@ pub async fn probe_and_plan(
             estimate,
         })
     } else {
-        let video_analysis = if input_analysis.is_some() {
-            let analysis = input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
-            Some(VideoAnalysis {
-                video: analysis
-                    .video
-                    .ok_or_else(|| SplatError::InvalidPath(input.clone()))?,
-                projection_detection: analysis.projection_detection,
-            })
-        } else {
-            video_analysis
-        };
+        let analysis = async {
+            let video_analysis = if input_analysis.is_some() {
+                let analysis =
+                    input_analysis_for_plan(&engine_paths, &input, input_analysis).await?;
+                Some(VideoAnalysis {
+                    video: analysis
+                        .video
+                        .ok_or_else(|| SplatError::InvalidPath(input.clone()))?,
+                    projection_detection: analysis.projection_detection,
+                })
+            } else {
+                video_analysis
+            };
+            video_analysis_for_plan(
+                &engine_paths.ffprobe,
+                &engine_paths.ffmpeg,
+                &input,
+                video_analysis,
+            )
+            .await
+        }
+        .await;
         let VideoAnalysis {
             video,
             projection_detection,
-        } = video_analysis_for_plan(
-            &engine_paths.ffprobe,
-            &engine_paths.ffmpeg,
-            &input,
-            video_analysis,
-        )
-        .await?;
+        } = video_preflight_diagnostics(&app, &engine_paths.ffprobe, &input, analysis).await?;
         let plan = if planner_enabled {
             QualityV2FrameSelection.create_plan(&video, &quality.preset())
         } else {

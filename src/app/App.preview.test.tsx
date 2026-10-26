@@ -243,6 +243,34 @@ describe("App preview workspace", () => {
     window.localStorage.clear();
   });
 
+  it("exposes the specific failed engine and its diagnostics", async () => {
+    await act(async () => {
+      useAppStore.setState({ engines: [{
+        kind: "ffprobe", path: "E:\\engines\\ffprobe.exe", exists: true,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "exit code -1073741515\nMissing runtime dependency",
+      }, {
+        kind: "ffmpeg", path: "E:\\engines\\ffmpeg.exe", exists: false,
+        canStart: false, version: null, cpuOnly: null, acceleration: null,
+        detail: "Executable not found",
+      }] });
+    });
+    const { checkEngines } = await import('../lib/backend');
+    const previousChecks = vi.mocked(checkEngines).mock.calls.length;
+    const details = container.querySelector<HTMLElement>(".engine-diagnostics")!;
+    const trigger = details.querySelector<HTMLButtonElement>(".engine-summary")!;
+    expect(trigger.textContent).toBe("2 个引擎异常");
+    expect(trigger.textContent).not.toMatch(/ffmpeg|ffprobe|colmap|brush/i);
+    expect(details.querySelector(".engine-diagnostics-panel")).toBeNull();
+    await act(async () => { trigger.focus(); });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(details.textContent).toContain("FFprobe");
+    expect(details.textContent).toContain("E:\\engines\\ffprobe.exe");
+    expect(details.querySelector('.engine-item-flags')?.textContent).toContain("可启动否");
+    expect(details.textContent).toContain("Missing runtime dependency");
+    expect(vi.mocked(checkEngines).mock.calls.length).toBe(previousChecks);
+  });
+
   it("shows the current package version and a start action without a trailing arrow", () => {
     expect(container.querySelector(".brand-name")?.textContent).toBe("OOOSplat");
     expect(container.querySelector(".version-tag")?.textContent).toBe(`LOCAL / ${packageMetadata.version}`);
@@ -1238,7 +1266,7 @@ describe("App preview workspace", () => {
     expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("Task List");
     expect(container.textContent).toContain("Start Generation");
-    expect(container.textContent).toContain("Checking bundled engines");
+    expect(container.textContent).toContain("Checking engines");
     expect(languageButton?.textContent).toContain("中文");
     expect(languageButton?.title).toBe("中英文切换 / Switch language");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
