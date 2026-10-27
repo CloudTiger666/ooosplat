@@ -245,12 +245,27 @@ impl PanoramaCheckpoint {
         video: &VideoInfo,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Self> {
+        Self::new_for_policy(source, quality, video, cancel, false)
+    }
+    pub fn new_for_policy(
+        source: &Path,
+        quality: Quality,
+        video: &VideoInfo,
+        cancel: &tokio_util::sync::CancellationToken,
+        native: bool,
+    ) -> Result<Self> {
         let (cap, face) = match quality {
             Quality::Fast => (2048, 512),
             Quality::Balanced => (3072, 768),
+            Quality::High if native => (video.width, video.width / 4),
             Quality::High => (4096, 1024),
         };
-        let width = video.width.min(cap) / 4 * 4;
+        let width = if native && quality == Quality::High {
+            video.width
+        } else {
+            video.width.min(cap) / 4 * 4
+        };
+        validate_training_cache_size(1, width as u64, u64::from(width / 2), face.min(width / 4))?;
         Ok(Self {
             version: CONVERSION_VERSION,
             source_sha256: fingerprint_cancellable(source, cancel)?,
@@ -676,11 +691,28 @@ pub fn prepare_reshoot_training_cache(
     cancel: &tokio_util::sync::CancellationToken,
     progress: impl Fn(TrainingCacheUpdate),
 ) -> Result<PathBuf> {
+    prepare_reshoot_training_cache_for_policy(
+        frames, model, root, records, quality, false, cancel, progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_reshoot_training_cache_for_policy(
+    frames: &Path,
+    model: &Path,
+    root: &Path,
+    records: &[crate::pipeline::reshoot::PanoramaFrameRecord],
+    quality: Quality,
+    native: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: impl Fn(TrainingCacheUpdate),
+) -> Result<PathBuf> {
     let cameras = crate::reconstruction::colmap_model::read_cameras(model)?;
     let poses = read_poses(model)?;
     let cap = match quality {
         Quality::Fast => 512,
         Quality::Balanced => 768,
+        Quality::High if native => u32::MAX,
         Quality::High => 1024,
     };
     let images = root.join("images");
@@ -954,7 +986,7 @@ pub fn prepare_training_cache(
 ) -> Result<PathBuf> {
     if config.version != CONVERSION_VERSION
         || config.face_size == 0
-        || config.face_size > 1024
+        || config.face_size > config.sfm_width / 4
         || config.field_of_view_degrees != FOV_DEGREES
     {
         return Err(process_error(
@@ -1831,6 +1863,23 @@ mod tests {
             (Quality::High, 4096, 1024),
         ] {
             let config = PanoramaCheckpoint::new(&source, q, &info).unwrap();
+            let native = PanoramaCheckpoint::new_for_policy(
+                &source,
+                q,
+                &info,
+                &tokio_util::sync::CancellationToken::new(),
+                true,
+            )
+            .unwrap();
+            if q == Quality::High {
+                assert_eq!(
+                    (native.sfm_width, native.sfm_height, native.face_size),
+                    (7680, 3840, 1920)
+                );
+                assert_eq!(native.field_of_view_degrees, 92.);
+            } else {
+                assert_eq!(native, config);
+            }
             assert_eq!(config.sfm_width, w);
             assert_eq!(config.face_size, face);
             assert_eq!(config.sfm_height, w / 2);
