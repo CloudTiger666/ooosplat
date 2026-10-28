@@ -878,6 +878,7 @@ pub async fn estimate_project_runtime(
             .max(1),
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         ..FramePlan::default()
     });

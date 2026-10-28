@@ -1,5 +1,5 @@
 export type Quality = "fast" | "balanced" | "high";
-export interface GenerationPolicy { version: 1 | 2; autoRetryEnabled: boolean; frameSamplingRatio: number | null; }
+export interface GenerationPolicy { version: 1 | 2 | 3; autoRetryEnabled: boolean; frameSamplingRatio: number | null; }
 export type EngineKind = "ffmpeg" | "ffprobe" | "colmap" | "brush";
 export type RunPhase = "idle" | "analyzing" | "running" | "completed" | "failed" | "cancelled";
 export type ProjectStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
@@ -50,6 +50,7 @@ export interface FramePlan {
   selectedFrames?: PlannedFrame[];
   candidateFrames?: PlannedFrame[];
   rescueMaxFrames?: number;
+  bridgeSourceFrames?: number | null;
   minimumFrameOverrideApplied?: boolean;
 }
 export interface RuntimeEstimate {

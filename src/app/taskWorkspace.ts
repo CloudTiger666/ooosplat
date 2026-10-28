@@ -151,4 +151,4 @@ export function draftDisplayName(draft: TaskDraft, newTaskLabel: string, reshoot
   return newTaskLabel;
 }
 
-export const draftGenerationPolicy = (draft: TaskDraft): import('../types/pipeline').GenerationPolicy => ({ version: 2, autoRetryEnabled: draft.autoRetryEnabled, frameSamplingRatio: draft.inputType === 'video' ? draft.frameSamplingRatio : null });
+export const draftGenerationPolicy = (draft: TaskDraft): import('../types/pipeline').GenerationPolicy => ({ version: 3, autoRetryEnabled: draft.autoRetryEnabled, frameSamplingRatio: draft.inputType === 'video' ? draft.frameSamplingRatio : null });

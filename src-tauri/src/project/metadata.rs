@@ -351,6 +351,8 @@ pub struct FrameState {
     pub selected_frames: Vec<PlannedFrame>,
     #[serde(default)]
     pub candidate_frames: Vec<PlannedFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_source_frames: Option<u64>,
     #[serde(default)]
     pub rescue_max_frames: u64,
     #[serde(default)]
@@ -388,6 +390,7 @@ impl From<&FramePlan> for FrameState {
             initial_extracted_frames: plan.estimated_frames,
             selected_frames: plan.selected_frames.clone(),
             candidate_frames: plan.candidate_frames.clone(),
+            bridge_source_frames: plan.bridge_source_frames,
             rescue_max_frames: plan.rescue_max_frames,
             minimum_frame_override_applied: plan.minimum_frame_override_applied,
         }

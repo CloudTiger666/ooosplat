@@ -57,7 +57,7 @@ https://github.com/user-attachments/assets/5b9e8cef-4c71-4bfa-ba23-641fcdd37659
 - **Image-order confirmation**: For ordinary or panorama folders with more than 100 images, confirm capture order before generation. Ordered sets use sequential matching; unordered sets and sets of up to 100 images use exhaustive matching.
 - **Image GPS**: Detect embedded location metadata and assist matching and reconstruction on the validated Windows x64 path. Reliable observations provide estimated north orientation and metric scale; otherwise the original workflow is used. [Scope and validation](docs/IMAGE_GPS.md)
 - **External model import**: Import standard/compressed PLY, SOG, SPZ, SPLAT, and KSPLAT from the Completed group. Complete COLMAP data is detected automatically; eligible projects can be reshot after compatibility checks. External files remain read-only.
-- **Three quality presets**: Reconstruction optimizations and frame backfill are standard. Adjust video sampling in discrete steps; Detailed preserves source training resolution and budgets ordinary-media splats from effective pixels and reconstruction tracks (coefficient 0.5). Panoramas retain a separate budget.
+- **Three quality presets**: Reconstruction optimizations and frame backfill are standard. Adjust video sampling in discrete steps, with at most 20% extra frames for manually sampled runs. Detailed preserves source training resolution and budgets ordinary-media splats from effective pixels and reconstruction tracks (coefficient 0.5). Panoramas retain a separate budget.
 - **Automatic retry**: Enabled by default; permits a lower splat ceiling after GPU OOM or a reshoot-plan fallback. Completed details mark retries that actually ran.
 - **Transparent media**: Transparent MOV and PNG files retain their original color and Alpha while OOOSplat creates the black-and-white masks required by COLMAP.
 - **Multi-task workspace**: Group tasks into New Tasks, Completed, and Unfinished. Keep multiple drafts, reorder them, and automatically run the next task. Only one generation task runs at a time; tasks can be cancelled or resumed.
@@ -86,12 +86,12 @@ Compressed PLY, SPZ, and SOG exports no longer reject models based on estimated 
 ```text
 Input video or image sequence
   │
-  ├─ Video: inspect with FFprobe and extract at the preset target FPS and working resolution; emit RGBA frames and masks for transparent media
+  ├─ Video: inspect with FFprobe and extract at the preset target FPS or manual ratio and working resolution; emit RGBA frames and masks for transparent media
   ├─ Images: scan headers and naturally sort filenames, copy source media, prefer hard links for internal reuse, and create Alpha masks when needed
   ├─ COLMAP: auto-select CPU/CUDA for features; sequential video matching, exhaustive images by default, ordered matching above 100 images, and preset loop detection
   ├─ COLMAP: incremental reconstruction and registration validation, with bridge-frame recovery; two-view triangulation only for actual transparent images
   ├─ Panoramas: retain full ERP images for spherical reconstruction, then convert registered images to six-face training data
-  ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed preserves source training resolution without VRAM tiers
+  ├─ Brush: train Gaussian Splats with an available GPU backend; Detailed plans training at source resolution
   └─ Validate the PLY and atomically publish final.ply
 ```
 
@@ -180,13 +180,15 @@ Usage notes:
 
 Sequential video and confirmed ordered-image matching use preset loop detection by default; valid loops are not guaranteed. Reshoots match old/new views separately, with window 10 and the preset loop policy among new ordered views. Backfill is independent of Automatic retry.
 
+For new manually sampled runs, initial registration below 80% with a valid initial model can trigger one targeted bridge attempt in unregistered intervals. It adds at most 20% of the actual initial frame count, capped by available source frames: 360 initial frames permit at most 72 extra; 100% sampling adds none. The 30-frame minimum still applies, or every available frame for shorter sources. Default sampling retains the candidate budgets below. Interrupted older runs retain their saved rules. The 1.2× ceiling controls frame counts, not time or success probability. See [bridge rules and validation](docs/MANUAL_BRIDGE_V3.md).
+
 Previous optimization behavior is now standard. Fast/Balanced retain working-resolution limits; Detailed uses source training resolution without upscaling. Images keep every valid input; video sampling uses discrete steps above the quality presets, including the exact source-FPS-derived default. See [generation defaults](docs/GENERATION_POLICY.md) and the [legacy configuration guide](docs/pipeline-optimization-config.en.md).
 
 The table below describes ordinary inputs. Ordinary Detailed budgets splats from registered training views' effective pixels and mean reconstruction track length, with coefficient 0.5. Fully transparent pixels are excluded; initialization points are never silently removed. See the [Detailed budget formula and scope](docs/FINE_SPLAT_BUDGET.md).
 
-Panorama Fast/Balanced retain optimized recipes and budgets. Panorama Detailed retains native ERP, derives width/4 training faces, and still caps splats at 40× the authoritative spherical model's final sparse point count, without multiplying by six or applying the old 10M ceiling. Caps guarantee neither achieved counts, quality, nor sufficient memory.
+Panoramas use dedicated training recipes and point budgets. Detailed retains native ERP and derives faces at `floor(ERP width / 4)` without upscaling. Point budgets use the original spherical model and are not multiplied by six. Caps guarantee neither achieved counts, quality, nor sufficient memory.
 
-| Preset | Initial / bridge-frame target | Video working long edge | COLMAP long edge / maximum features | Brush training |
+| Preset | Default initial / bridge-candidate target | Video working long edge | COLMAP long edge / maximum features | Brush training |
 | --- | ---: | ---: | ---: | --- |
 | Fast | 6 / 9 FPS | Up to 1,600 | 1,200 / 4,096 | 8,000 iterations, maximum resolution 1,600 |
 | Balanced | 8 / 12 FPS | Up to 1,920 | 1,600 / 8,192 | 15,000 iterations, maximum resolution 1,920 |
@@ -194,7 +196,7 @@ Panorama Fast/Balanced retain optimized recipes and budgets. Panorama Detailed r
 
 Short videos target a minimum of 30 selected frames when the source provides enough frames. Initial and candidate sampling rates can therefore exceed the table's targets, but never exceed the source FPS or frame count.
 
-Detailed no longer uses VRAM tiers. With Automatic retry enabled, all three presets may retry once after explicit GPU OOM, at 80% of the failed process's last trustworthy splat count, without lowering resolution. Missing counts, no actual reduction, or budgets below initialization fail directly. Backend compatibility fallbacks and frame backfill remain enabled independently.
+Detailed training resolution no longer uses VRAM tiers. With Automatic retry enabled, all three presets may retry once after explicit GPU OOM, at 80% of the failed process's last trustworthy splat count, without lowering resolution. Missing counts, no actual reduction, or budgets below initialization fail directly. Backend compatibility fallbacks and frame backfill remain enabled independently.
 
 Interrupted tasks retain frozen settings. Manually retrying a failed task uses the new policy and archives incompatible work caches, preserving source files, published models and edits.
 

@@ -8,6 +8,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use crate::planner::plan_bridge_backfill;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -43,7 +45,7 @@ use crate::{
         EventKind, EventLevel, PipelineEngine, PipelineEvent, PipelineStage,
     },
     planner::{
-        bridge_trigger_ratio, plan_bridge_backfill, read_registered_source_indices,
+        bridge_trigger_ratio, plan_bridge_backfill_cancellable, read_registered_source_indices,
         write_bridge_pair_list, BridgeBackfillStatus,
     },
     presets::{
@@ -727,8 +729,12 @@ impl PipelineRunner {
                 .unwrap_or(selected_count)
         };
         let has_candidates = is_planned_video && !is_reshoot;
+        let source_candidates = plan
+            .and_then(|plan| plan.bridge_source_frames)
+            .or_else(|| frames.and_then(|frames| frames.bridge_source_frames));
         let candidate_count = if has_candidates {
-            plan.map(|plan| plan.candidate_frames.len() as u64)
+            source_candidates
+                .or_else(|| plan.map(FramePlan::candidate_count))
                 .or_else(|| frames.map(|frames| frames.candidate_frames.len() as u64))
                 .filter(|count| *count > 0)
                 .unwrap_or(initial_selected_count)
@@ -747,7 +753,9 @@ impl PipelineRunner {
             source_height,
             source_item_count,
             configured_target_fps: is_planned_video.then_some(preset.initial_fps).flatten(),
-            configured_candidate_fps: has_candidates.then_some(preset.rescue_max_fps).flatten(),
+            configured_candidate_fps: (has_candidates && source_candidates.is_none())
+                .then_some(preset.rescue_max_fps)
+                .flatten(),
             effective_target_fps: effective_fps(initial_selected_count),
             effective_candidate_fps: (!is_reshoot)
                 .then(|| effective_fps(candidate_count))
@@ -1008,7 +1016,7 @@ impl PipelineRunner {
     ) -> Result<PreparedFrames> {
         self.events
             .stage(PipelineStage::ProbingVideo, 0.0, "正在读取视频信息");
-        let video = match probed_video {
+        let mut video = match probed_video {
             Some(video) => video,
             None => {
                 probe_video(
@@ -1069,6 +1077,9 @@ impl PipelineRunner {
             )
             .await?;
             self.events.panorama_phase.store(1, Ordering::Relaxed);
+            if let Some(total) = plan.bridge_source_frames {
+                video.total_frames = total;
+            }
             self.events
                 .stage(PipelineStage::ExtractingFrames, 0.0, "正在提取全景画面");
             tokio::fs::write(
@@ -1087,8 +1098,8 @@ impl PipelineRunner {
                 "预计提取 {} 帧（目标 {:.2} FPS，候选池 {} 帧 / 最高约 {:.2} FPS）",
                 plan.estimated_frames,
                 plan.sampling_fps,
-                plan.candidate_frames.len(),
-                plan.candidate_frames.len() as f64 / video.duration.max(f64::EPSILON)
+                plan.candidate_count(),
+                plan.candidate_count() as f64 / video.duration.max(f64::EPSILON)
             ),
         );
 
@@ -2000,11 +2011,16 @@ impl PipelineRunner {
             .as_ref()
             .and_then(|r| r.recipe.as_ref())
             .is_some_and(|r| r.actual != r.initial);
+        let manual_bridge_changed = policy.frame_sampling_ratio.is_some()
+            && state
+                .generation_policy
+                .is_some_and(|old| (old.version >= 3) != (policy.version >= 3));
         let frames_changed = (state.input_type == ProjectInputType::Video
             && (!state.planner_enabled
                 || state.generation_policy.and_then(|p| p.frame_sampling_ratio)
                     != policy.frame_sampling_ratio
                 || schedule_changed
+                || manual_bridge_changed
                 || video_pixels_changed))
             || (legacy && state.reshoot.is_some())
             || reshoot_plan_changed
@@ -4303,11 +4319,19 @@ impl PipelineRunner {
                     return Ok((initial_model, initial_report));
                 }
             };
-            let plan = plan_bridge_backfill(
-                &prepared.plan,
-                &registered,
-                initial_report.registered_images,
-            );
+            let frame_plan = prepared.plan.clone();
+            let registered_images = initial_report.registered_images;
+            let cancellation = self.process_manager.child_token();
+            let plan = crate::presets::spawn_pipeline_blocking(move || {
+                plan_bridge_backfill_cancellable(
+                    &frame_plan,
+                    &registered,
+                    registered_images,
+                    &cancellation,
+                )
+            })
+            .await
+            .map_err(|e| SplatError::Process(e.to_string()))??;
             state.bridge_backfill.plan = Some(plan.clone());
             state.bridge_backfill.initial_model = Some(relative_model_path(paths, &initial_model));
             if plan.selected_frame_indices.is_empty() {
@@ -4338,18 +4362,17 @@ impl PipelineRunner {
             plan
         };
 
-        let additional = bridge_plan
-            .selected_frame_indices
-            .iter()
-            .filter_map(|index| {
-                prepared
-                    .plan
-                    .candidate_frames
-                    .iter()
-                    .find(|frame| frame.source_frame_index == *index)
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
+        validate_manual_bridge_plan(&prepared.plan, &bridge_plan)?;
+        let work = paths.work.clone();
+        let panorama = state.panorama.is_some();
+        let plan = prepared.plan.clone();
+        let indices = bridge_plan.selected_frame_indices.clone();
+        let fps = prepared.video.as_ref().map(|v| v.fps);
+        let additional = crate::presets::spawn_pipeline_blocking(move || {
+            resolve_bridge_frames(&work, panorama, &plan, &indices, fps)
+        })
+        .await
+        .map_err(|e| SplatError::Process(e.to_string()))??;
         if additional.len() != bridge_plan.selected_frame_indices.len() {
             state.bridge_backfill.status = BridgeBackfillStatus::FailedRolledBack;
             project_manager.write_state(&paths.state, state).await?;
@@ -5673,6 +5696,7 @@ async fn prepared_frames_from_checkpoint(
         estimated_frames: frames.estimated_frames,
         selected_frames: frames.selected_frames.clone(),
         candidate_frames: frames.candidate_frames.clone(),
+        bridge_source_frames: frames.bridge_source_frames,
         rescue_max_frames: frames.rescue_max_frames,
         minimum_frame_override_applied: frames.minimum_frame_override_applied,
     };
@@ -6156,11 +6180,80 @@ fn update_frame_checkpoint(state: &mut PipelineStateFile, prepared: &PreparedFra
         frames.sampling_fps = prepared.plan.sampling_fps;
         frames.selected_frames = prepared.plan.selected_frames.clone();
         frames.candidate_frames = prepared.plan.candidate_frames.clone();
+        frames.bridge_source_frames = prepared.plan.bridge_source_frames;
         frames.rescue_max_frames = prepared.plan.rescue_max_frames;
         frames.minimum_frame_override_applied = prepared.plan.minimum_frame_override_applied;
         frames.mask_count = Some(prepared.mask_count);
         frames.colmap_input_version = Some(COLMAP_INPUT_VERSION);
     }
+}
+
+fn validate_manual_bridge_plan(
+    plan: &FramePlan,
+    bridge: &crate::planner::bridge_backfill::BridgeBackfillPlan,
+) -> Result<()> {
+    if let Some(total) = plan.bridge_source_frames {
+        let initial = bridge.initial_input_images;
+        let budget = (initial / 5).min(total.saturating_sub(initial));
+        if initial > total
+            || bridge.available_budget != budget
+            || plan.rescue_max_frames != initial.saturating_add(budget)
+            || bridge.selected_frame_indices.len() as u64 > budget
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .any(|index| *index >= total)
+            || bridge
+                .selected_frame_indices
+                .iter()
+                .collect::<HashSet<_>>()
+                .len()
+                != bridge.selected_frame_indices.len()
+        {
+            return Err(SplatError::Process(
+                "Invalid manual bridge checkpoint".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_bridge_frames(
+    work: &Path,
+    panorama: bool,
+    plan: &FramePlan,
+    indices: &[u64],
+    fps: Option<f64>,
+) -> Result<Vec<crate::video::PlannedFrame>> {
+    if let Some(total) = plan.bridge_source_frames {
+        if indices.iter().any(|index| *index >= total) {
+            return Err(SplatError::Process(
+                "Bridge frame index is out of range".into(),
+            ));
+        }
+        if panorama {
+            return crate::video::panorama::bridge_source_frames(work, total, indices);
+        }
+        let fps = fps
+            .filter(|fps| fps.is_finite() && *fps > 0.)
+            .ok_or_else(|| SplatError::Process("Invalid bridge source frame rate".into()))?;
+        return Ok(indices
+            .iter()
+            .map(|index| crate::video::PlannedFrame {
+                source_frame_index: *index,
+                timestamp_seconds: *index as f64 / fps,
+            })
+            .collect());
+    }
+    Ok(indices
+        .iter()
+        .filter_map(|index| {
+            plan.candidate_frames
+                .iter()
+                .find(|frame| frame.source_frame_index == *index)
+                .cloned()
+        })
+        .collect())
 }
 
 fn oriented_video_dimensions(video: &VideoInfo) -> (u32, u32) {
@@ -6294,6 +6387,401 @@ mod tests {
             .unwrap();
         assert_eq!(training.configured_max_splats, Some(2_220_679));
         assert_eq!(training.preset.max_splats, Some(3_000_000));
+    }
+
+    #[tokio::test]
+    async fn manual_bridge_upgrade_archives_incompatible_cache_with_a_durable_barrier() {
+        for manual in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = ProjectPaths::existing(uuid::Uuid::new_v4(), root.path().join("project"));
+            for dir in [
+                &paths.frames,
+                &paths.colmap_frames,
+                &paths.masks,
+                &paths.colmap,
+                &paths.brush,
+            ] {
+                tokio::fs::create_dir_all(dir).await.unwrap();
+                tokio::fs::write(dir.join("sentinel"), b"old")
+                    .await
+                    .unwrap();
+            }
+            tokio::fs::write(paths.project.join("final.ply"), b"published")
+                .await
+                .unwrap();
+            tokio::fs::write(paths.project.join("edit.ply"), b"edited")
+                .await
+                .unwrap();
+            let manager = ProjectManager::with_root(root.path().into());
+            let runner =
+                PipelineRunner::new(EnginePaths::from_root(root.path().join("engines")), |_| {});
+            let old = super::super::generation_policy::GenerationPolicy {
+                version: 2,
+                frame_sampling_ratio: manual.then_some(0.9),
+                ..Default::default()
+            };
+            let new = super::super::generation_policy::GenerationPolicy { version: 3, ..old };
+            let video = VideoInfo {
+                duration: 60.,
+                fps: 30.,
+                total_frames: 1800,
+                width: 1920,
+                height: 1080,
+                codec: "h264".into(),
+                rotation: 0,
+                pixel_format: "yuv420p".into(),
+                has_alpha: false,
+            };
+            let mut state = PipelineStateFile::created(Quality::Fast);
+            state.generation_policy = Some(old);
+            state.planner_enabled = true;
+            state.configuration = Some((*crate::presets::pipeline_optimization_config()).clone());
+            state.resolution_plan = Some(old.resolution(Quality::Fast, None, 1920, 1080, true));
+            state.frames = Some(FrameState::from(&old.frame_plan(&video, Quality::Fast)));
+            state.video = Some(video);
+            state.features_complete = true;
+            state.matching_complete = true;
+            state.reconstruction_complete = true;
+            if manual {
+                tokio::fs::write(paths.work.join("cache-archive"), b"blocked")
+                    .await
+                    .unwrap();
+                assert!(runner
+                    .prepare_failed_retry(&manager, &paths, &mut state, new)
+                    .await
+                    .is_err());
+                state = manager.read_state(&paths.state).await.unwrap();
+                assert!(!state.reconstruction_complete);
+                assert!(state
+                    .retry_cache_pending
+                    .iter()
+                    .any(|path| path == "colmap"));
+                assert!(paths.colmap.join("sentinel").exists());
+                tokio::fs::remove_file(paths.work.join("cache-archive"))
+                    .await
+                    .unwrap();
+            }
+            runner
+                .prepare_failed_retry(&manager, &paths, &mut state, new)
+                .await
+                .unwrap();
+            assert_eq!(paths.colmap.join("sentinel").exists(), !manual);
+            assert_eq!(paths.frames.join("sentinel").exists(), !manual);
+            assert_eq!(state.reconstruction_complete, !manual);
+            assert!(state.retry_cache_pending.is_empty());
+            assert_eq!(
+                std::fs::read(paths.project.join("final.ply")).unwrap(),
+                b"published"
+            );
+            assert_eq!(
+                std::fs::read(paths.project.join("edit.ply")).unwrap(),
+                b"edited"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_bridge_checkpoint_freezes_original_budget_across_partial_extraction() {
+        let mut plan = FramePlan {
+            estimated_frames: 10,
+            selected_frames: (0..100)
+                .step_by(10)
+                .map(|index| PlannedFrame {
+                    source_frame_index: index,
+                    timestamp_seconds: index as f64 / 30.,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        plan.use_manual_bridge_budget(1000);
+        let bridge = plan_bridge_backfill(&plan, &[0, 90].into_iter().collect(), 2);
+        validate_manual_bridge_plan(&plan, &bridge).unwrap();
+        let added = resolve_bridge_frames(
+            Path::new("unused"),
+            false,
+            &plan,
+            &bridge.selected_frame_indices,
+            Some(30.),
+        )
+        .unwrap();
+        assert_eq!(added.len(), 2);
+        assert!(
+            resolve_bridge_frames(Path::new("unused"), false, &plan, &[1000], Some(30.)).is_err()
+        );
+        let mut saved = FrameState::from(&plan);
+        saved.selected_frames.extend(added);
+        saved.extracted_frames = Some(12);
+        let saved: FrameState =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(saved.initial_extracted_frames, 10);
+        let resumed = FramePlan {
+            selected_frames: saved.selected_frames,
+            bridge_source_frames: saved.bridge_source_frames,
+            rescue_max_frames: saved.rescue_max_frames,
+            ..Default::default()
+        };
+        validate_manual_bridge_plan(&resumed, &bridge).unwrap();
+        assert_eq!(resumed.rescue_max_frames, 12);
+        let mut invalid = bridge.clone();
+        invalid.available_budget = 3;
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        invalid = bridge.clone();
+        invalid.selected_frame_indices[1] = invalid.selected_frame_indices[0];
+        assert!(validate_manual_bridge_plan(&resumed, &invalid).is_err());
+        let old: FrameState =
+            serde_json::from_str(r#"{"retentionRatio":0.5,"samplingFps":15,"estimatedFrames":10}"#)
+                .unwrap();
+        assert_eq!(old.bridge_source_frames, None);
+    }
+
+    #[test]
+    fn manual_bridge_metrics_distinguish_source_candidates_from_extracted_frames() {
+        let tracker = PlannerEffectivenessTracker::default();
+        let runner = PipelineRunner::new(default_engine_paths(None), |_| {})
+            .with_effectiveness_tracker(tracker.clone());
+        let video = VideoInfo {
+            duration: 60.,
+            fps: 30.,
+            total_frames: 1800,
+            width: 4096,
+            height: 2048,
+            codec: "h264".into(),
+            rotation: 0,
+            pixel_format: "yuv420p".into(),
+            has_alpha: false,
+        };
+        let policy = super::super::generation_policy::GenerationPolicy {
+            frame_sampling_ratio: Some(0.2),
+            ..Default::default()
+        };
+        let plan = policy.frame_plan(&video, Quality::High);
+        let mut state = PipelineStateFile::created(Quality::High);
+        state.video = Some(video);
+        state.generation_policy = Some(policy);
+        state.frames = Some(FrameState::from(&plan));
+        runner.record_frame_metrics(&state, 360, Some(&plan));
+        let metrics = tracker.snapshot().frame_plan.unwrap();
+        assert_eq!(metrics.initial_selected_count, 360);
+        assert_eq!(metrics.candidate_count, 1800);
+        assert_eq!(metrics.configured_candidate_fps, None);
+        assert_eq!(plan.rescue_max_frames, 432);
+    }
+
+    #[tokio::test]
+    #[ignore = "Runs bundled FFmpeg/FFprobe on isolated synthetic video; no SfM or training"]
+    async fn native_manual_bridge_v3_extraction_and_rollback() {
+        use crate::process::ProcessSpec;
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let engines = EnginePaths::from_root(workspace.join("engines"));
+        assert!(engines.ffmpeg.is_file() && engines.ffprobe.is_file());
+        let root = workspace
+            .join(".cache/manual-bridge-v3")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let mut records = Vec::new();
+        for (name, panorama, alpha) in [
+            ("ordinary", false, false),
+            ("ordinary-alpha", false, true),
+            ("panorama-vfr", true, false),
+            ("panorama-vfr-alpha", true, true),
+        ] {
+            let work = root.join(name);
+            std::fs::create_dir_all(&work).unwrap();
+            let input = work.join("source.mov");
+            let mut filter = String::from("format=rgba");
+            if alpha {
+                filter.push_str(",colorchannelmixer=aa=0.5");
+            }
+            if panorama {
+                filter.push_str(",setpts=PTS+5/TB+0.2*floor(N/15)/TB");
+            }
+            let manager = ProcessManager::new();
+            let result = manager
+                .run(ProcessSpec {
+                    executable: engines.ffmpeg.clone(),
+                    args: vec![
+                        "-v".into(),
+                        "error".into(),
+                        "-f".into(),
+                        "lavfi".into(),
+                        "-i".into(),
+                        "testsrc=size=128x64:rate=30:duration=4".into(),
+                        "-vf".into(),
+                        filter.into(),
+                        "-fps_mode".into(),
+                        "vfr".into(),
+                        "-c:v".into(),
+                        "qtrle".into(),
+                        "-pix_fmt".into(),
+                        "argb".into(),
+                        "-threads".into(),
+                        "1".into(),
+                        "-y".into(),
+                        input.as_os_str().to_owned(),
+                    ],
+                    working_directory: Some(work.clone()),
+                    log_path: Some(work.join("generate.log")),
+                    observer: None,
+                })
+                .await
+                .unwrap();
+            assert!(result.success, "{}", result.failure_detail());
+            let source_before = std::fs::read(&input).unwrap();
+            let mut video = probe_video(&engines.ffprobe, &input, None, &manager)
+                .await
+                .unwrap();
+            // Opaque case explicitly exercises the RGB/JPEG extraction path;
+            // Alpha cases exercise aligned RGBA, COLMAP images, and masks.
+            video.has_alpha = alpha;
+            let policy = super::super::generation_policy::GenerationPolicy {
+                frame_sampling_ratio: Some(if panorama { 0.3 } else { 0.5 }),
+                ..Default::default()
+            };
+            let runner =
+                PipelineRunner::new(engines.clone(), |_| {}).with_generation_policy(Some(policy));
+            let frames = work.join("frames");
+            let colmap = work.join("colmap_frames");
+            let masks = work.join("masks");
+            let prepared = runner
+                .prepare_frames(
+                    &input,
+                    Quality::Fast,
+                    &frames,
+                    &colmap,
+                    &masks,
+                    None,
+                    true,
+                    Some(video),
+                    panorama.then_some((128, 64)),
+                    panorama,
+                )
+                .await
+                .unwrap();
+            let base: Vec<_> = prepared
+                .plan
+                .selected_frames
+                .iter()
+                .map(|frame| {
+                    let file = frames.join(format!(
+                        "frame_{:010}.{}",
+                        frame.source_frame_index,
+                        if alpha { "png" } else { "jpg" }
+                    ));
+                    (file.clone(), std::fs::read(file).unwrap())
+                })
+                .collect();
+            let registered = [
+                prepared
+                    .plan
+                    .selected_frames
+                    .first()
+                    .unwrap()
+                    .source_frame_index,
+                prepared
+                    .plan
+                    .selected_frames
+                    .last()
+                    .unwrap()
+                    .source_frame_index,
+            ]
+            .into_iter()
+            .collect();
+            let bridge = plan_bridge_backfill(&prepared.plan, &registered, 2);
+            validate_manual_bridge_plan(&prepared.plan, &bridge).unwrap();
+            let added = resolve_bridge_frames(
+                &work,
+                panorama,
+                &prepared.plan,
+                &bridge.selected_frame_indices,
+                prepared.video.as_ref().map(|v| v.fps),
+            )
+            .unwrap();
+            assert!(!added.is_empty());
+            assert!(added.len() as u64 <= prepared.extracted_frames / 5);
+            if panorama {
+                let times: Vec<crate::video::panorama::FrameTime> = serde_json::from_slice(
+                    &std::fs::read(work.join("panorama-frame-times.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(times[0].timestamp_seconds >= 5.);
+                assert!(times
+                    .windows(2)
+                    .any(|p| p[1].timestamp_seconds - p[0].timestamp_seconds > 0.1));
+                for frame in &added {
+                    assert_eq!(
+                        frame.timestamp_seconds,
+                        times[frame.source_frame_index as usize].timestamp_seconds
+                    );
+                }
+            }
+            let cancelled = ProcessManager::new();
+            cancelled.cancel();
+            assert!(extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                None,
+                &cancelled,
+                None
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            let output = extract_additional_frames(
+                &engines.ffmpeg,
+                &input,
+                &frames,
+                &colmap,
+                &masks,
+                &added,
+                alpha,
+                Some((128, 64)),
+                Some(work.join("bridge.log")),
+                &manager,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                output.frame_count,
+                prepared.extracted_frames + added.len() as u64
+            );
+            for (file, bytes) in &base {
+                assert_eq!(&std::fs::read(file).unwrap(), bytes);
+            }
+            let count = output.frame_count;
+            remove_bridge_outputs(&frames, &colmap, &masks, &added, alpha).await;
+            assert_eq!(
+                validate_extraction(&frames, &colmap, &masks, alpha)
+                    .await
+                    .unwrap()
+                    .frame_count,
+                prepared.extracted_frames
+            );
+            assert_eq!(std::fs::read(&input).unwrap(), source_before);
+            records.push(
+                serde_json::json!({"case":name,"initial":prepared.extracted_frames,
+                "budget":prepared.plan.rescue_max_frames,"added":added.len(),"combined":count,
+                "sourceUnchanged":true,"cancelAndRollbackProtected":true}),
+            );
+        }
+        std::fs::write(
+            root.join("result.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+        eprintln!("Native manual bridge evidence: {}", root.display());
     }
 
     #[tokio::test]

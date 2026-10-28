@@ -4,9 +4,9 @@ use super::*;
 fn generation_defaults_are_not_retry_consent_and_invalid_ratios_are_rejected() {
     let defaults = generation_parameters(None).unwrap();
     assert_eq!(defaults["generationPolicy"]["autoRetryEnabled"], true);
-    assert_eq!(defaults["generationPolicy"]["version"], 2);
+    assert_eq!(defaults["generationPolicy"]["version"], 3);
     let migrated = generation_parameters(Some(serde_json::json!({"generationPolicy":{"version":1,"autoRetryEnabled":false,"frameSamplingRatio":0.5}}))).unwrap();
-    assert_eq!(migrated["generationPolicy"]["version"], 2);
+    assert_eq!(migrated["generationPolicy"]["version"], 3);
     assert_eq!(migrated["generationPolicy"]["autoRetryEnabled"], false);
     let off=generation_parameters(Some(serde_json::json!({"generationPolicy":{"autoRetryEnabled":false,"frameSamplingRatio":0.333},"reshootOptions":{"allowFallback":true}}))).unwrap();
     assert_eq!(off["generationPolicy"]["frameSamplingRatio"], 0.333);

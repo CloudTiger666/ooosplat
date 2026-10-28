@@ -6,13 +6,17 @@
 
 原自动优化的重建、闭环和自动补帧成为默认行为；“自动重试”只授权改变预期方案的重试，默认开启。关闭不会关闭补帧或后端兼容回退。
 
-| 档位 | 基础抽帧 | 补帧候选目标 | 普通素材训练 | 全景 ERP／六面 |
+| 档位 | 基础抽帧 | 默认补帧候选目标 | 普通素材训练 | 全景 ERP／六面 |
 |---|---:|---:|---|---|
 | 快速 | 6 FPS | 9 FPS | 现有优化配方，最大长边1600 | 2048／512上限，不放大 |
 | 均衡 | 8 FPS | 12 FPS | 现有优化配方，最大长边1920 | 3072／768上限，不放大 |
 | 精细 | 12 FPS | 15 FPS | 原始分辨率 | 原始 ERP，六面边长 `floor(宽度/4)` |
 
-视频滑轨控制首次抽帧比例，不包含补帧。界面手动档位为0.1%、10%、20%……100%，另保留按源 FPS 换算的精确默认值及恢复的旧比例；百分比居中显示。切换质量档位／恢复默认清除手动覆盖。后端比例范围与抽帧算法不变，保留至少30帧规则，源帧不足时全部采用。候选池不小于基础选择，100%不会再增加重复帧。图片始终处理全部选中素材。
+视频滑轨控制首次抽帧比例，不包含补帧。界面手动档位为0.1%、10%、20%……100%，另保留按源 FPS 换算的精确默认值及恢复的旧比例；百分比居中显示。切换质量档位／恢复默认清除手动覆盖。后端比例范围与首次选帧索引不变，保留至少30帧规则，源帧不足时全部采用。图片始终处理全部选中素材。
+
+策略版本3中，仅手动抽帧改为总量最多1.2倍：首次实际抽取`N`帧、源视频可用`T`帧时，最多新增`min(N / 5 向下取整, T − N)`帧。100%不新增。默认档位仍用表中9／12／15 FPS候选预算。初始注册率低于80%、存在有效初始模型时，按未注册区间优先级从源帧范围按需选取，不再受旧候选池密度限制；不提前枚举或抽取全部源帧。只尝试一轮，保存预算及选择，续跑不重复扩大。
+
+候选范围与允许抽取总量分开记录；候选数量不代表已经抽取或将全部参与训练。全景保存生成阶段已读取的完整真实PTS索引，补帧复用它，不另跑整段探测，也不按平均FPS伪造时间。GUI／CLI／MCP新任务和显式失败重试默认版本3；已有版本1／2任务中断续跑保持原规则，升级重试使用现有归档屏障处理不兼容工作缓存。1.2倍只是帧数预算，不是耗时或成功率承诺。[边界与原生验证](MANUAL_BRIDGE_V3.md)。
 
 精细档不按显存分档：普通30000步，阈值0.0015、选择比例0.15、截止24000；全景45000步，阈值0.001、比例0.30、截止38000；Refine均为200步。策略版本2的普通素材采用[有效像素预算](FINE_SPLAT_BUDGET.md)：`round(0.5 × sqrt(2462476 × 0.063362106 × X_eff / meanTrackLength))`；仅统计已注册训练图片，扣除 Alpha 为零的像素，半透明像素仍计入。全景继续使用最终有效球面 COLMAP 稀疏点数×40，不乘六，不保留原1000万硬上限。旧 PLY 初始化超过预算时仅提高至初始化点数，不丢点。上限不是增密目标；数量溢出和引擎数值范围仍校验。旧版本任务续跑保持原快照及原预算。
 
@@ -33,6 +37,10 @@
 
 Previous optimization behavior is now standard, independently of the default-on Automatic retry switch. Initial video sampling remains 6/8/12 FPS, with 9/12/15 FPS backfill candidate targets. Manual slider detents are 0.1%, 10%, 20% through 100%, plus the exact FPS-derived default and restored legacy values. The slider controls only initial sampling, preserves the existing 30-frame minimum, and never limits a larger manual base selection to the rescue pool. Images are not subsampled.
 
+Policy v3 changes only manual sampling: for `N` initially selected frames from `T` source frames, add at most `min(floor(N/5), T-N)`. The initial indices remain unchanged. Default sampling retains the 9/12/15 FPS candidate pools. Below 80% initial registration with a valid initial model, one bridge attempt searches unregistered intervals lazily across source indices, independently of the old pool. It does not extract all candidates, and resume cannot renew the frozen budget. Panorama bridges reuse the bounded real PTS index already probed during generation, including VFR and nonzero start times. Candidate availability is not the extraction budget or the number of training views.
+
+New GUI/CLI/MCP tasks and explicit failed-run retries default to v3; interrupted v1/v2 runs retain their saved policy. Incompatible retry caches use the existing durable archive barrier. The 1.2× limit controls frame counts, not time or success probability. Training recipes, Automatic retry consent, and existing reshoot dispatch are unchanged. See [scope and native validation](MANUAL_BRIDGE_V3.md).
+
 Detailed uses source-resolution training, including native ERP and width/4 cubemap faces at 92°. SfM feature limits and the 512 MiB image decode guard remain. Policy version 2 uses the [effective-pixel budget](FINE_SPLAT_BUDGET.md) for ordinary media: `round(0.5 × sqrt(2462476 × 0.063362106 × X_eff / meanTrackLength))`. Only registered training views contribute; zero-alpha pixels are excluded, while positive semi-transparent pixels count. Panoramas retain 40× the final valid spherical sparse point count, without VRAM tiers or the old 10M cap. A larger trusted PLY initialization raises the effective ceiling without discarding points. Saved older runs retain their original policy. This is a ceiling, not a promised final count.
 
 Only verified GPU OOM may retry once at 80% of the failed process's last trustworthy reported count. Missing counts, ineffective reductions, or ceilings below initialization fail without guessing. Other training settings remain unchanged. Reshoot algorithm fallbacks also require this switch; compatibility fallbacks and backfill remain standard. Completed details mark actual controlled retries, not permission alone.
@@ -40,6 +48,8 @@ Only verified GPU OOM may retry once at 80% of the failed process's last trustwo
 New tasks and manual retries use the new policy; interrupted resumes retain frozen legacy settings. Incompatible working caches are archived with a durable reuse barrier, while source files, published models and edits remain protected. All preset tiers enable two-view triangulation only for actual transparent training images, including video frames.
 
 ## 验证记录 / Verification
+
+2026-10-28 手动补帧版本3验证见[独立记录](MANUAL_BRIDGE_V3.md)。下方版本1／2记录保留为历史，不代表重新执行完整训练。
 
 2026-10-27 普通精细档预算更新为策略版本2、系数0.5；全景保持原策略。498项 Rust、600项前端及7项诊断测试、构建、Clippy与格式检查通过，真实90张图片只读核算得到2,220,679上限。[实现与验证详情](FINE_SPLAT_BUDGET.md)。以下记录保留为此前默认策略实现的历史验证，不代表重新完成了训练画质测试。
 

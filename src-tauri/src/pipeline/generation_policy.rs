@@ -7,7 +7,7 @@ use crate::{
     video::{FramePlan, FrameSelectionStrategy, QualityV2FrameSelection, VideoInfo},
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
@@ -57,7 +57,11 @@ impl GenerationPolicy {
         if let Some(ratio) = self.frame_sampling_ratio {
             preset.initial_fps = Some(video.fps * ratio);
         }
-        QualityV2FrameSelection.create_plan(video, &preset)
+        if self.version >= 3 && self.frame_sampling_ratio.is_some() {
+            QualityV2FrameSelection.create_manual_bridge_plan(video, &preset)
+        } else {
+            QualityV2FrameSelection.create_plan(video, &preset)
+        }
     }
 
     pub fn resolution(
@@ -266,6 +270,131 @@ mod tests {
             12
         );
     }
+    #[test]
+    fn manual_bridge_v3_preserves_initial_frames_and_caps_only_extra_frames() {
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            for (ratio, initial, maximum) in [
+                (0.001, 30, 36),
+                (0.2, 360, 432),
+                (0.5, 900, 1080),
+                (0.9, 1620, 1800),
+                (1., 1800, 1800),
+                (0.333, 599, 718),
+            ] {
+                let policy = GenerationPolicy {
+                    frame_sampling_ratio: Some(ratio),
+                    ..Default::default()
+                };
+                let plan = policy.frame_plan(&video(1800, 30.), quality);
+                assert_eq!(plan.estimated_frames, initial);
+                assert_eq!(plan.rescue_max_frames, maximum);
+                assert_eq!(plan.bridge_source_frames, Some(1800));
+                assert_eq!(plan.candidate_count(), 1800);
+                for version in [1, 2] {
+                    let old = GenerationPolicy { version, ..policy }
+                        .frame_plan(&video(1800, 30.), quality);
+                    assert_eq!(old.selected_frames, plan.selected_frames);
+                    assert_eq!(plan.candidate_frames, plan.selected_frames);
+                    assert_eq!(old.bridge_source_frames, None);
+                    assert_eq!(old.rescue_max_frames, old.candidate_frames.len() as u64);
+                }
+                assert_eq!(
+                    plan,
+                    GenerationPolicy {
+                        auto_retry_enabled: false,
+                        ..policy
+                    }
+                    .frame_plan(&video(1800, 30.), quality)
+                );
+            }
+            let default_plan = GenerationPolicy::default().frame_plan(&video(1800, 30.), quality);
+            for version in [1, 2] {
+                assert_eq!(
+                    default_plan,
+                    GenerationPolicy {
+                        version,
+                        ..Default::default()
+                    }
+                    .frame_plan(&video(1800, 30.), quality)
+                );
+            }
+        }
+        let policy = GenerationPolicy {
+            frame_sampling_ratio: Some(0.001),
+            ..Default::default()
+        };
+        let short = policy.frame_plan(&video(12, 30.), Quality::High);
+        assert_eq!((short.estimated_frames, short.rescue_max_frames), (12, 12));
+    }
+
+    #[test]
+    fn manual_bridge_candidates_stay_compact_when_low_fps_legacy_pool_covers_source() {
+        let policy = GenerationPolicy {
+            frame_sampling_ratio: Some(0.001),
+            ..Default::default()
+        };
+        let plan = policy.frame_plan(&video(12_000_000, 6.), Quality::High);
+        assert_eq!(plan.selected_frames.len(), 12_000);
+        assert_eq!(plan.candidate_frames.len(), 12_000);
+        assert_eq!(plan.candidate_count(), 12_000_000);
+        assert_eq!(plan.rescue_max_frames, 14_400);
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            let low_fps = video(600, 6.);
+            let current = policy.frame_plan(&low_fps, quality);
+            let old = GenerationPolicy {
+                version: 2,
+                ..policy
+            }
+            .frame_plan(&low_fps, quality);
+            assert_eq!(current.selected_frames, old.selected_frames);
+            assert_eq!(current.candidate_frames.len(), 30);
+        }
+    }
+
+    #[test]
+    fn v3_keeps_v2_resolution_and_training_recipes() {
+        let old = GenerationPolicy {
+            version: 2,
+            ..Default::default()
+        };
+        let new = GenerationPolicy::default();
+        for quality in [Quality::Fast, Quality::Balanced, Quality::High] {
+            for memory in [None, Some(8192), Some(24576)] {
+                let resolution = new.resolution(quality, memory, 4096, 2048, true);
+                assert_eq!(
+                    resolution,
+                    old.resolution(quality, memory, 4096, 2048, true)
+                );
+                assert_eq!(
+                    new.training(
+                        quality,
+                        memory,
+                        &resolution,
+                        10000,
+                        10000,
+                        Some(&budget(10000))
+                    )
+                    .unwrap(),
+                    old.training(
+                        quality,
+                        memory,
+                        &resolution,
+                        10000,
+                        10000,
+                        Some(&budget(10000))
+                    )
+                    .unwrap()
+                );
+                assert_eq!(
+                    new.panorama_training(quality, memory, 1024, 10000, 10000)
+                        .unwrap(),
+                    old.panorama_training(quality, memory, 1024, 10000, 10000)
+                        .unwrap()
+                );
+            }
+        }
+    }
+
     #[test]
     fn retry_switch_does_not_change_initial_plan_or_preset_and_input_is_validated() {
         let off = GenerationPolicy {
